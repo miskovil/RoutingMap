@@ -1,6 +1,5 @@
 import streamlit as st
 import routing
-print(f"DEBUG: routing module file: {routing.__file__}")
 import weather
 from datetime import datetime, timedelta
 import pandas as pd

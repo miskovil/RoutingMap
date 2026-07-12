@@ -17,7 +17,7 @@ An application that provides weather forecasts along a driving route.
 ## How to Run
 1. Install dependencies:
    ```bash
-   pip install requests polyline streamlit pandas
+   pip install -r requirements.txt
    ```
 2. Run the application:
    ```bash
