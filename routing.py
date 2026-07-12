@@ -1,16 +1,76 @@
 import requests
 import polyline
 import random
-from math import radians, cos, sin, sqrt, atan2
+import os
+import time
+from math import radians, cos, sin, sqrt, atan2, pi
+from functools import lru_cache
 
-def get_route(start_coords, end_coords):
+# Rate limiting for Nominatim (free tier recommends max 1 request/sec)
+_last_nominatim_request_time = time.time()
+_nominatim_min_delay = 1.1  # seconds between requests
+
+# Simple cache for geocoding results to avoid repeated API calls
+_geocode_cache = {}
+
+def _rate_limit_nominatim():
+    """Enforce rate limiting for Nominatim API calls."""
+    global _last_nominatim_request_time
+    elapsed = time.time() - _last_nominatim_request_time
+    if elapsed < _nominatim_min_delay:
+        time.sleep(_nominatim_min_delay - elapsed)
+    _last_nominatim_request_time = time.time()
+
+def _retry_with_backoff(func, max_retries=3, initial_delay=2):
+    """Retry a function with exponential backoff."""
+    delay = initial_delay
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                # Check if it's a rate limit error (429)
+                if '429' in str(e) or 'Too many requests' in str(e):
+                    time.sleep(delay)
+                    delay *= 2  # Exponential backoff
+                else:
+                    raise
+    
+    # If we exhausted retries, raise the last error
+    if last_error:
+        raise last_error
+    raise Exception(f"Failed after {max_retries} retries")
+
+def get_route(start_coords, end_coords, avoid_tolls=False, avoid_highways=False, avoid_ferries=False, fuel_economical=False):
     """
     Fetches route from OSRM API.
     start_coords: (lat, lon)
     end_coords: (lat, lon)
     Returns: List of (lat, lon) points and duration in seconds.
     """
-    url = f"http://router.project-osrm.org/route/v1/driving/{start_coords[1]},{start_coords[0]};{end_coords[1]},{end_coords[0]}?overview=full&geometries=polyline"
+    # Build OSRM request with optional exclusions
+    base = f"http://router.project-osrm.org/route/v1/driving/{start_coords[1]},{start_coords[0]};{end_coords[1]},{end_coords[0]}"
+    params = "?overview=full&geometries=polyline"
+    exclude_parts = []
+    if avoid_highways:
+        exclude_parts.append('motorway')
+    if avoid_tolls:
+        # OSRM may accept 'toll' depending on profile; include it to attempt avoiding tolls
+        exclude_parts.append('toll')
+    if avoid_ferries:
+        exclude_parts.append('ferry')
+
+    if exclude_parts:
+        params += "&exclude=" + ",".join(exclude_parts)
+
+    if fuel_economical:
+        # Ask for alternatives so we can pick the shortest-distance route
+        params += "&alternatives=true"
+
+    url = base + params
     response = requests.get(url)
     if response.status_code != 200:
         raise Exception(f"Error fetching route: {response.text}")
@@ -19,44 +79,154 @@ def get_route(start_coords, end_coords):
     if data['code'] != 'Ok':
         raise Exception(f"OSRM Error: {data['code']}")
     
-    route = data['routes'][0]
-    geometry = route['geometry']
-    duration = route['duration']
-    
+    # Choose a route. If alternatives requested (fuel_economical), pick the route
+    # with the smallest distance (better for fuel consumption generally).
+    routes = data.get('routes', [])
+    if not routes:
+        raise Exception("No routes returned by OSRM")
+
+    chosen = routes[0]
+    if fuel_economical and len(routes) > 1:
+        # Pick route with minimal distance
+        chosen = min(routes, key=lambda r: r.get('distance', float('inf')))
+
+    geometry = chosen.get('geometry')
+    duration = chosen.get('duration')
     points = polyline.decode(geometry)
     return points, duration
 
-def geocode(address):
+def geocode(address, use_cache=True):
     """
     Simple geocoding using Nominatim (OSM).
     Returns (lat, lon, display_name)
     """
+    # Check cache first
+    if use_cache and address in _geocode_cache:
+        return _geocode_cache[address]
+    
     url = f"https://nominatim.openstreetmap.org/search?q={address}&format=json&limit=1"
     headers = {'User-Agent': 'WeatherRouteApp/1.0'}
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        raise Exception(f"Error geocoding: {response.text}")
     
-    data = response.json()
+    def do_request():
+        _rate_limit_nominatim()
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            raise Exception(f"Error geocoding: {response.text}")
+        return response
+    
+    response = _retry_with_backoff(do_request, max_retries=3, initial_delay=2)
+    
+    try:
+        data = response.json()
+    except ValueError as e:
+        raise Exception(f"Invalid response from geocoding service: {e}")
+    
     if not data:
         raise Exception(f"Address not found: {address}")
     
-    return float(data[0]['lat']), float(data[0]['lon']), data[0]['display_name']
+    result = (float(data[0]['lat']), float(data[0]['lon']), data[0]['display_name'])
+    
+    # Cache the result
+    if use_cache:
+        _geocode_cache[address] = result
+    
+    return result
 
-def get_suggestions(query):
+def get_traffic_multiplier(departure_time, start_coords=None, end_coords=None):
+    """
+    Returns a travel time multiplier. Prefer live traffic if available, otherwise
+    fall back to a heuristic model based on typical city traffic.
+
+    If a TOMTOM_API_KEY environment variable is present and start_coords is
+    provided, this function will query TomTom's flowSegmentData API for a
+    representative traffic speed near the start location and compute a multiplier
+    from the ratio of free-flow speed to current speed.
+    """
+
+    # Try to use a live traffic service if available (TomTom flow API).
+    # NOTE: Truly keyless, reliable, global traffic APIs are uncommon. If you
+    # want more accurate live traffic, set TOMTOM_API_KEY in your environment.
+    tomtom_key = os.environ.get('TOMTOM_API_KEY')
+
+    if tomtom_key and start_coords is not None:
+        try:
+            lat, lon = start_coords
+            url = f"https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json?point={lat},{lon}&key={tomtom_key}"
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                fs = data.get('flowSegmentData', {})
+                current_speed = fs.get('currentSpeed')
+                free_flow = fs.get('freeFlowSpeed')
+                if current_speed and free_flow and current_speed > 0:
+                    ratio = free_flow / current_speed
+                    # Clamp ratio to avoid extreme multipliers
+                    return max(0.7, min(2.5, ratio))
+        except Exception:
+            # On any failure, fall back to the heuristic below
+            pass
+
+    # Heuristic fallback when no live traffic info is available.
+    hour = departure_time.hour + departure_time.minute / 60.0
+
+    # Morning peak (centered at 8:30)
+    morning_peak = 0.8 * 0.5 * (1 + cos((hour - 8.5) * (2 * pi / 4))) if 6.5 <= hour <= 10.5 else 0
+    # Evening peak (centered at 17:30)
+    evening_peak = 1.0 * 0.5 * (1 + cos((hour - 17.5) * (2 * pi / 4))) if 15.5 <= hour <= 19.5 else 0
+
+    # Night speedup (centered at 3:00)
+    night_factor = -0.2 * 0.5 * (1 + cos((hour - 3.0) * (2 * pi / 6))) if 0 <= hour <= 6 else 0
+
+    multiplier = 1.0 + morning_peak + evening_peak + night_factor
+    return max(0.8, multiplier)
+
+def predict_travel_times(start_coords, end_coords, base_duration):
+    """
+    Predicts travel times for different departure times throughout a day.
+    Returns a list of (time, predicted_duration)
+    """
+    from datetime import time, datetime, timedelta
+    
+    predictions = []
+    # Start from midnight
+    base_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    for hour in range(0, 24):
+        for minute in [0, 30]:
+            dep_time = base_date + timedelta(hours=hour, minutes=minute)
+            multiplier = get_traffic_multiplier(dep_time)
+            predictions.append({
+                "Departure Time": dep_time.strftime("%H:%M"),
+                "Predicted Duration (min)": (base_duration * multiplier) / 60,
+                "Multiplier": multiplier
+            })
+            
+    return predictions
+
+def get_suggestions(query, use_cache=True):
     """
     Fetches location suggestions from Nominatim.
     """
     if not query or len(query) < 3:
         return []
 
+    cache_key = f"suggestions:{query}"
+    if use_cache and cache_key in _geocode_cache:
+        return _geocode_cache[cache_key]
+    
     url = f"https://nominatim.openstreetmap.org/search?q={query}&format=json&limit=5"
     headers = {'User-Agent': 'WeatherRouteApp/1.0'}
+    
     try:
-        response = requests.get(url, headers=headers)
+        _rate_limit_nominatim()
+        response = requests.get(url, headers=headers, timeout=10)
         if response.status_code == 200:
             data = response.json()
-            return [item['display_name'] for item in data]
+            suggestions = [item['display_name'] for item in data]
+            # Cache suggestions
+            if use_cache:
+                _geocode_cache[cache_key] = suggestions
+            return suggestions
     except Exception:
         pass
     return []

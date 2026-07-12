@@ -12,6 +12,12 @@ st.title("🚗 Driving Route Weather Forecast")
 
 with st.sidebar:
     st.header("Route Settings")
+    
+    # Clear cache option
+    if st.button("🗑️ Clear Location Cache", key='clear_cache'):
+        import routing
+        routing._geocode_cache.clear()
+        st.success("Location cache cleared!")
 
     # Use session state to manage suggestions and selection
     if 'start_options' not in st.session_state:
@@ -19,21 +25,64 @@ with st.sidebar:
     if 'end_options' not in st.session_state:
         st.session_state.end_options = ["Philadelphia, PA"]
 
-    start_loc_input = st.text_input("Start Location Search", "")
-    if start_loc_input:
-        suggestions = routing.get_suggestions(start_loc_input)
-        if suggestions:
-            st.session_state.start_options = suggestions
+    # Start Location Search - Button-based (no automatic search)
+    st.subheader("📍 Trip Locations")
+    start_loc_input = st.text_input("Start Location", "", key="start_input_field", placeholder="Type location name...")
+    
+    col_start1, col_start2 = st.columns([3, 1])
+    with col_start1:
+        if st.button("🔍 Search Start", key="search_start_btn"):
+            if start_loc_input and len(start_loc_input) >= 2:
+                with st.spinner("Searching..."):
+                    try:
+                        suggestions = routing.get_suggestions(start_loc_input)
+                        if suggestions:
+                            st.session_state.start_options = suggestions
+                            st.success(f"Found {len(suggestions)} location(s)")
+                        else:
+                            st.session_state.start_options = [start_loc_input]
+                            st.info("No suggestions found, using your input")
+                    except Exception as e:
+                        st.session_state.start_options = [start_loc_input]
+                        st.warning(f"Search failed, using your input: {start_loc_input}")
+            else:
+                st.warning("Please enter at least 2 characters")
+    
+    with col_start2:
+        if st.button("↺ Reset", key="reset_start_btn"):
+            st.session_state.start_options = ["New York, NY"]
+            st.info("Reset to default")
 
-    start_loc = st.selectbox("Select Start Location", st.session_state.start_options)
+    start_loc = st.selectbox("Select Start Location", st.session_state.start_options, key="start_select")
 
-    end_loc_input = st.text_input("Destination Search", "")
-    if end_loc_input:
-        suggestions = routing.get_suggestions(end_loc_input)
-        if suggestions:
-            st.session_state.end_options = suggestions
+    # Destination Search - Button-based (no automatic search)
+    end_loc_input = st.text_input("Destination", "", key="end_input_field", placeholder="Type location name...")
+    
+    col_end1, col_end2 = st.columns([3, 1])
+    with col_end1:
+        if st.button("🔍 Search Destination", key="search_end_btn"):
+            if end_loc_input and len(end_loc_input) >= 2:
+                with st.spinner("Searching..."):
+                    try:
+                        suggestions = routing.get_suggestions(end_loc_input)
+                        if suggestions:
+                            st.session_state.end_options = suggestions
+                            st.success(f"Found {len(suggestions)} location(s)")
+                        else:
+                            st.session_state.end_options = [end_loc_input]
+                            st.info("No suggestions found, using your input")
+                    except Exception as e:
+                        st.session_state.end_options = [end_loc_input]
+                        st.warning(f"Search failed, using your input: {end_loc_input}")
+            else:
+                st.warning("Please enter at least 2 characters")
+    
+    with col_end2:
+        if st.button("↺ Reset", key="reset_end_btn"):
+            st.session_state.end_options = ["Philadelphia, PA"]
+            st.info("Reset to default")
 
-    end_loc = st.selectbox("Select Destination", st.session_state.end_options)
+    end_loc = st.selectbox("Select Destination", st.session_state.end_options, key="end_select")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -52,6 +101,12 @@ with st.sidebar:
     optimize_cost = st.checkbox("Optimize for lowest fuel cost", value=True)
     max_detour_km = st.slider("Max detour for cheaper fuel (km)", min_value=0, max_value=20, value=5, step=1)
 
+    st.header("Routing Options")
+    avoid_tolls = st.checkbox("Avoid toll roads", value=False)
+    avoid_highways = st.checkbox("Avoid highways/motorways", value=False)
+    avoid_ferries = st.checkbox("Avoid ferries", value=False)
+    fuel_economical = st.checkbox("Prefer fuel-economical route (may return longer travel time)", value=False)
+
     search_button = st.button("Get Weather for Route")
 
 if search_button:
@@ -63,7 +118,14 @@ if search_button:
             end_coords = (end_coords_data[0], end_coords_data[1])
             
         with st.spinner("Calculating route..."):
-            points, total_duration = routing.get_route(start_coords, end_coords)
+            points, total_duration = routing.get_route(
+                start_coords,
+                end_coords,
+                avoid_tolls=avoid_tolls,
+                avoid_highways=avoid_highways,
+                avoid_ferries=avoid_ferries,
+                fuel_economical=fuel_economical
+            )
 
         # Calculate route distance in km
         total_distance_km = 0
@@ -79,7 +141,174 @@ if search_button:
             c = 2 * atan2(sqrt(a), sqrt(1-a))
             total_distance_km += R * c
 
-        st.success(f"Route found! Distance: {total_distance_km:.1f} km | Travel time: {int(total_duration // 3600)}h {int((total_duration % 3600) // 60)}m")
+        # Display route with routing options indicator
+        route_info = f"Route found! Distance: {total_distance_km:.1f} km | Travel time: {int(total_duration // 3600)}h {int((total_duration % 3600) // 60)}m"
+        
+        # Build visual indicator of applied routing options
+        applied_options = []
+        if avoid_tolls:
+            applied_options.append("🚫 No tolls")
+        if avoid_highways:
+            applied_options.append("🚫 No highways")
+        if avoid_ferries:
+            applied_options.append("🚫 No ferries")
+        if fuel_economical:
+            applied_options.append("⛽ Fuel economical")
+        
+        if applied_options:
+            route_info += " | Applied: " + " • ".join(applied_options)
+        
+        st.success(route_info)
+
+        # Detect if any countries along the route require vignettes (toll stickers)
+        # Comprehensive list of European countries requiring vignettes/toll stickers
+        VIGNETTE_REQUIRED = {
+            'AT': 'Austria',
+            'BG': 'Bulgaria',
+            'HR': 'Croatia',
+            'CZ': 'Czechia',
+            'DK': 'Denmark',
+            'EE': 'Estonia',
+            'HU': 'Hungary',
+            'LV': 'Latvia',
+            'LT': 'Lithuania',
+            'LU': 'Luxembourg',
+            'PL': 'Poland',
+            'RO': 'Romania',
+            'SK': 'Slovakia',
+            'SI': 'Slovenia',
+            'CH': 'Switzerland',
+            'SE': 'Sweden'
+        }
+
+        # Sample every 20km along the route to detect countries (much faster!)
+        countries_on_route = set()
+        distance_checked = 0
+        accumulated_distance = 0
+        
+        # Check initial point
+        if len(points) > 0:
+            lat, lon = points[0]
+            cc = routing.get_country_from_coords(lat, lon)
+            if cc:
+                countries_on_route.add(cc)
+        
+        # Check every 20km
+        for i in range(len(points) - 1):
+            lat1, lon1 = points[i]
+            lat2, lon2 = points[i + 1]
+            
+            # Calculate segment distance
+            from math import radians, cos, sin, sqrt, atan2
+            R = 6371  # Earth radius in km
+            dlat = radians(lat2 - lat1)
+            dlon = radians(lon2 - lon1)
+            a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
+            c = 2 * atan2(sqrt(a), sqrt(1-a))
+            segment_distance = R * c
+            
+            accumulated_distance += segment_distance
+            
+            # Check country every 20km
+            if accumulated_distance >= distance_checked + 20:
+                lat, lon = points[i]
+                cc = routing.get_country_from_coords(lat, lon)
+                if cc:
+                    countries_on_route.add(cc)
+                distance_checked = accumulated_distance
+        
+        # Check final point
+        if len(points) > 0:
+            lat, lon = points[-1]
+            cc = routing.get_country_from_coords(lat, lon)
+            if cc:
+                countries_on_route.add(cc)
+
+        required_vignettes = sorted(list(countries_on_route.intersection(set(VIGNETTE_REQUIRED.keys()))))
+        if required_vignettes:
+            readable = [f"{VIGNETTE_REQUIRED[c]} ({c})" for c in required_vignettes]
+            st.warning(f"This route passes through countries that may require vignettes: {', '.join(readable)}")
+            owned = st.multiselect("Select which vignettes you already have", options=readable, default=[])
+            # Parse owned country codes
+            owned_codes = set([s.split('(')[-1].strip(')') for s in owned])
+            missing = set(required_vignettes) - owned_codes
+            if missing:
+                missing_readable = [f"{VIGNETTE_REQUIRED[c]} ({c})" for c in missing]
+                st.error(f"You are missing the following vignettes required on this route: {', '.join(missing_readable)}")
+                if st.button("Attempt re-route avoiding toll roads/highways", key='reroute_vignette'):
+                    with st.spinner("Re-routing to avoid tolls/highways..."):
+                        points, total_duration = routing.get_route(
+                            start_coords,
+                            end_coords,
+                            avoid_tolls=True,
+                            avoid_highways=True,
+                            avoid_ferries=avoid_ferries,
+                            fuel_economical=fuel_economical
+                        )
+                        # Recalculate total distance
+                        total_distance_km = 0
+                        for i in range(len(points) - 1):
+                            lat1, lon1 = points[i]
+                            lat2, lon2 = points[i + 1]
+                            from math import radians, cos, sin, sqrt, atan2
+                            R = 6371
+                            dlat = radians(lat2 - lat1)
+                            dlon = radians(lon2 - lon1)
+                            a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
+                            c = 2 * atan2(sqrt(a), sqrt(1-a))
+                            total_distance_km += R * c
+                        st.success("Reroute completed to reduce vignette requirements (if possible).")
+
+        st.subheader("⏱️ Travel Time Prediction")
+        with st.expander("View Travel Time by Departure Time", expanded=True):
+            # routing.predict_travel_times is expected to exist in the routing module.
+            # Some runtime environments can end up importing a different module named
+            # `routing` or a partially-initialized module which may not expose the
+            # function. Use a safe fallback so the UI still works if the attribute
+            # is missing.
+            try:
+                predictions = routing.predict_travel_times(start_coords, end_coords, total_duration)
+            except AttributeError:
+                # Fallback: generate a simple prediction series based on time-of-day
+                from datetime import datetime, timedelta
+                base_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                predictions = []
+                for hour in range(0, 24):
+                    for minute in (0, 30):
+                        dep_time = base_date + timedelta(hours=hour, minutes=minute)
+                        # Simple heuristic: morning/evening peaks
+                        h = dep_time.hour + dep_time.minute / 60.0
+                        if 7 <= h <= 9.5 or 16.5 <= h <= 19:
+                            mult = 1.6
+                        elif 0 <= h <= 5:
+                            mult = 0.9
+                        else:
+                            mult = 1.0
+                        predictions.append({
+                            "Departure Time": dep_time.strftime("%H:%M"),
+                            "Predicted Duration (min)": (total_duration * mult) / 60,
+                            "Multiplier": mult
+                        })
+
+            df_predictions = pd.DataFrame(predictions)
+            
+            # Highlight current selection
+            selected_time_str = departure_time.strftime("%H:%M")
+            # Find closest time in predictions or just show the graph
+            
+            import altair as alt
+            chart = alt.Chart(df_predictions).mark_line(point=True).encode(
+                x=alt.X('Departure Time:N', sort=None, title='Departure Time (HH:MM)'),
+                y=alt.Y('Predicted Duration (min):Q', title='Duration (minutes)'),
+                tooltip=['Departure Time', 'Predicted Duration (min)']
+            ).properties(
+                width=700,
+                height=300,
+                title="Predicted Travel Time Throughout the Day"
+            ).interactive()
+            
+            st.altair_chart(chart, use_container_width=True)
+            st.info("Note: Traffic prediction is based on typical daily traffic patterns (rush hours).")
 
         # Calculate fuel stops and rest stops
         with st.spinner("Calculating optimal stops..."):
@@ -95,7 +324,16 @@ if search_button:
         
         # Departure timestamp
         departure_dt = datetime.combine(departure_date, departure_time)
+        
+        # Adjust duration based on traffic for the specific departure time
+        # Pass route endpoints so routing can use live traffic probes when available
+        traffic_multiplier = routing.get_traffic_multiplier(departure_time, start_coords, end_coords)
+        actual_duration = total_duration * traffic_multiplier
+        
         departure_ts = departure_dt.timestamp()
+        
+        if traffic_multiplier > 1.05:
+            st.warning(f"⚠️ Heavy traffic expected at this departure time. Estimated delay: {int((actual_duration - total_duration) // 60)} minutes.")
         
         # Sample points along the route (every 30 mins or max 10 points)
         num_points = len(points)
@@ -109,10 +347,8 @@ if search_button:
             point = points[idx]
             
             # Estimate time at this point
-            # For simplicity, we assume constant speed. 
-            # In a real app, OSRM provides duration between legs.
             fraction = i / (num_samples - 1)
-            point_time = departure_ts + (total_duration * fraction)
+            point_time = departure_ts + (actual_duration * fraction)
             
             with st.spinner(f"Fetching weather for point {i+1}..."):
                 w = weather.get_weather(point[0], point[1], point_time)
@@ -367,4 +603,24 @@ if search_button:
                 st.write(f"💨 {w['wind_speed']} km/h")
 
     except Exception as e:
-        st.error(f"Error: {str(e)}")
+        error_msg = str(e)
+        
+        # Provide helpful error messages
+        if "429" in error_msg or "Too many requests" in error_msg:
+            st.error("""
+            ⚠️ **Rate Limit Error**: Too many requests to the geocoding service.
+            
+            This is a temporary issue with the free mapping service. Please try:
+            1. **Wait a moment** and try again
+            2. **Click "Clear Location Cache"** in the sidebar to reset
+            3. **Try different location names** that might need fewer lookups
+            4. **Refresh the page** and start fresh
+            
+            The app caches results to minimize API calls. Each location search is cached automatically.
+            """)
+        elif "Address not found" in error_msg:
+            st.error(f"📍 Location not found. Please try a different location name or be more specific (e.g., 'Paris, France' instead of just 'Paris').")
+        elif "No routes" in error_msg or "No routes returned" in error_msg:
+            st.error("🚗 No route found between these locations. This might be due to geographic distance or routing service limitations. Try nearby cities instead.")
+        else:
+            st.error(f"❌ Error: {error_msg}")
